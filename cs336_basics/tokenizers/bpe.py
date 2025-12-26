@@ -60,6 +60,39 @@ class BPETokenizerTrainer:
         for i, token in enumerate(self.special_tokens, start=256):
             self.vocab[i] = token.encode('utf-8')
 
+    def _worker(self, chunk_info: Tuple[str, int, int]) -> Dict[Tuple[bytes, ...], int]:
+        """
+        Worker function for parallel pre-tokenization.
+        Args:
+            chunk_info: Tuple of (file_path, start, end) byte offsets.
+        Returns:
+            A dictionary mapping pre-token tuples to their frequency counts.
+        """
+        file_path, start, end = chunk_info
+        # get the chunk bytes
+        with open(file_path, 'rb') as f:
+            f.seek(start)
+            chunk_bytes = f.read(end - start)
+
+        # decode the bytes into utf-8
+        chunk_text = chunk_bytes.decode("utf-8")
+
+        # remove special tokens from chunk_text
+        for token in self.special_tokens:
+            chunk_text = chunk_text.replace(token, '')
+
+        # find all matches
+        matches = re.findall(pattern=PAT, string=chunk_text)
+
+        # get the frequency of all matches
+        freq: Dict[Tuple[bytes, ...], int] = {}
+        for match in matches:
+            # Convert each character in the match to bytes separately
+            # This creates a tuple of bytes objects, not a tuple of ints
+            token_bytes = tuple(bytes([b]) for b in match.encode('utf-8'))
+            freq[token_bytes] = freq.get(token_bytes, 0) + 1
+        return freq
+
     def _pre_tokenize_parallel(self, boundaries: List[int]) -> Dict[Tuple[bytes, ...], int]:
         """"
         Pre-tokenize the text corpus in parallel using the defined regex pattern with multiprocessing.
@@ -71,33 +104,9 @@ class BPETokenizerTrainer:
         # prepare chunks
         chunks = [(self.input_path, boundaries[i], boundaries[i+1]) for i in range(len(boundaries)-1)]
 
-        def worker(chunk_info: Tuple[str, int, int]) -> Dict[Tuple[bytes, ...], int]:
-            file_path, start, end = chunk_info
-            # get the chunk bytes
-            with open(file_path, 'rb') as f:
-                f.seek(start)
-                chunk_bytes = f.read(end - start)
-
-            # decode the bytes into utf-8
-            chunk_text = chunk_bytes.decode("utf-8")
-
-            # remove special tokens from chunk_text
-            for token in self.special_tokens:
-                chunk_text = chunk_text.replace(token, '')
-
-            # find all matches
-            matches = re.findall(pattern=PAT, string=chunk_text)
-
-            # get the frequency of all matches
-            freq: Dict[Tuple[bytes, ...], int] = {}
-            for match in matches:
-                token_bytes = tuple(match.encode('utf-8'))
-                freq[token_bytes] = freq.get(token_bytes, 0) + 1
-            return freq
-
         with Pool(processes=self.num_workers) as pool:
-            results = pool.map(worker, chunks)
-        
+            results = pool.map(self._worker, chunks)
+
         # merge results
         total_freq: Dict[Tuple[bytes, ...], int] = {}
 
@@ -119,9 +128,73 @@ class BPETokenizerTrainer:
         # pre-tokenize in parallel
         pre_token_freq = self._pre_tokenize_parallel(boundaries)
 
-        # BPE merging process
+        # initialize pair_to_tuples index and pair_freq
+        pair_to_tuples: Dict[Tuple[bytes, bytes], set] = {}
+        pair_freq: Dict[Tuple[bytes, bytes], int] = {}
 
-        pass
+        for token_tuple, freq in pre_token_freq.items():
+            for i in range(len(token_tuple) - 1):
+                pair = (token_tuple[i], token_tuple[i + 1])
+                if pair not in pair_to_tuples:
+                    pair_to_tuples[pair] = set()
+                pair_to_tuples[pair].add(token_tuple)
+                pair_freq[pair] = pair_freq.get(pair, 0) + freq
+
+        # BPE merging process
+        for merge_iter in range(self.num_merges):
+            # find the most frequent pair in lexicographically greater order
+            # key: (frequency, lexicographic order of pair)
+            most_frequent_pair = max(pair_freq.items(), key=lambda x: (x[1], x[0]))[0]
+
+            # merge the most frequent pair
+            self.merges.append(most_frequent_pair)
+            merged_token = most_frequent_pair[0] + most_frequent_pair[1]
+            self.vocab[len(self.vocab)] = merged_token
+
+            # update pre_token_freq, pair_to_tuples and pair_freq with the new merged token
+            # only update token_tuples that contain the most_frequent_pair
+            affected_tuples = pair_to_tuples.get(most_frequent_pair, set()).copy()
+
+            for token_tuple in affected_tuples:
+                freq = pre_token_freq.pop(token_tuple)  # remove old tuple
+
+                # remove old token_tuple from pair_to_tuples and update pair_freq
+                for i in range(len(token_tuple) - 1):
+                    old_pair = (token_tuple[i], token_tuple[i + 1])
+                    if old_pair in pair_to_tuples:
+                        pair_to_tuples[old_pair].discard(token_tuple)
+                        # decrement the frequency
+                        pair_freq[old_pair] -= freq
+                        if not pair_to_tuples[old_pair]:
+                            del pair_to_tuples[old_pair]
+                            del pair_freq[old_pair]
+
+                # create new tuple with merged pair
+                new_tuple = []
+                i = 0
+                while i < len(token_tuple):
+                    # if we find the pair, merge it
+                    if i < len(token_tuple) - 1 and (token_tuple[i], token_tuple[i + 1]) == most_frequent_pair:
+                        new_tuple.append(merged_token)
+                        i += 2  # skip both elements of the pair
+                    else:
+                        new_tuple.append(token_tuple[i])
+                        i += 1
+
+                # convert back to tuple and update frequency
+                new_tuple_key = tuple(new_tuple)
+                pre_token_freq[new_tuple_key] = pre_token_freq.get(new_tuple_key, 0) + freq
+
+                # add new token_tuple to pair_to_tuples index and update pair_freq
+                for i in range(len(new_tuple_key) - 1):
+                    new_pair = (new_tuple_key[i], new_tuple_key[i + 1])
+                    if new_pair not in pair_to_tuples:
+                        pair_to_tuples[new_pair] = set()
+                    pair_to_tuples[new_pair].add(new_tuple_key)
+                    # increment the frequency
+                    pair_freq[new_pair] = pair_freq.get(new_pair, 0) + freq
+
+        return self.vocab, self.merges
 
 
 def bpe_train(
