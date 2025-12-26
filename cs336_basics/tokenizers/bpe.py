@@ -1,14 +1,22 @@
 import regex as re
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, BinaryIO
+from multiprocessing import Pool
+import mmap
 
 # Standard BPE tokenization pattern for GPT-2
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 class BPETokenizerTrainer:
-    def __init__(self, vocab_size: int, special_tokens: List[str]):
+    def __init__(
+        self,
+        vocab_size: int, 
+        special_tokens: List[str],
+        num_workers: int = 4
+    ):
         # parameters
         self.vocab_size = vocab_size
         self.special_tokens = special_tokens
+        self.num_workers = num_workers
 
         # derived parameters
         self.init_vocab_size = 256 + len(special_tokens)
@@ -18,12 +26,31 @@ class BPETokenizerTrainer:
         self.vocab: Dict[int, bytes] = {}
         self.merges: List[Tuple[bytes, bytes]] = []
 
-    def _load_corpus(self, input_path: str) -> str:
+    def _find_chunk_boundaries(self, file: BinaryIO) -> List[int]:
         """
-        Load the text corpus from the specified file path.
+        Find chunk boundaries in the file based on special tokens.
+        Args:
+            file: A binary file object opened in 'rb' mode.
+        Returns:
+            A list of byte offsets representing chunk boundaries.
+
+        Note: This function is used to split the file for parallel processing.
+        And it uses mmap for efficient file access.
         """
-        with open(input_path, 'r', encoding='utf-8') as f:
-            return f.read()
+        # spilit the whole file into chunks based on special tokens
+        mmaped = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
+        boundaries = [0]
+
+        for token in self.special_tokens:
+            token_bytes = token.encode('utf-8')
+            pos = 0
+            while (pos := mmaped.find(token_bytes, pos)) != -1:
+                boundaries.append(pos)
+                pos += len(token_bytes)
+
+        boundaries.append(mmaped.size())
+        mmaped.close()
+        return sorted(set(boundaries))
 
     def _init_vocab(self):
         """
@@ -33,10 +60,67 @@ class BPETokenizerTrainer:
         for i, token in enumerate(self.special_tokens, start=256):
             self.vocab[i] = token.encode('utf-8')
 
-    def pre_tokenize_parallel(self, corpus: str) -> Dict[Tuple[bytes, ...], int]:
-        pass
+    def _pre_tokenize_parallel(self, boundaries: List[int]) -> Dict[Tuple[bytes, ...], int]:
+        """"
+        Pre-tokenize the text corpus in parallel using the defined regex pattern with multiprocessing.
+        Args:
+            boundaries: List of byte offsets representing chunk boundaries.
+        Returns:
+            A dictionary mapping pre-token tuples to their frequency counts.
+        """
+        # prepare chunks
+        chunks = [(self.input_path, boundaries[i], boundaries[i+1]) for i in range(len(boundaries)-1)]
+
+        def worker(chunk_info: Tuple[str, int, int]) -> Dict[Tuple[bytes, ...], int]:
+            file_path, start, end = chunk_info
+            # get the chunk bytes
+            with open(file_path, 'rb') as f:
+                f.seek(start)
+                chunk_bytes = f.read(end - start)
+
+            # decode the bytes into utf-8
+            chunk_text = chunk_bytes.decode("utf-8")
+
+            # remove special tokens from chunk_text
+            for token in self.special_tokens:
+                chunk_text = chunk_text.replace(token, '')
+
+            # find all matches
+            matches = re.findall(pattern=PAT, string=chunk_text)
+
+            # get the frequency of all matches
+            freq: Dict[Tuple[bytes, ...], int] = {}
+            for match in matches:
+                token_bytes = tuple(match.encode('utf-8'))
+                freq[token_bytes] = freq.get(token_bytes, 0) + 1
+            return freq
+
+        with Pool(processes=self.num_workers) as pool:
+            results = pool.map(worker, chunks)
+        
+        # merge results
+        total_freq: Dict[Tuple[bytes, ...], int] = {}
+
+        for freq in results:
+            for token_tuple, count in freq.items():
+                total_freq[token_tuple] = total_freq.get(token_tuple, 0) + count
+
+        return total_freq
 
     def train(self, input_path: str) -> Tuple[Dict[int, bytes], List[Tuple[bytes, bytes]]]:
+        self.input_path = input_path
+        # intialize vocab
+        self._init_vocab()
+
+        # find chunk boundaries
+        with open(input_path, 'rb') as f:
+            boundaries = self._find_chunk_boundaries(f)
+
+        # pre-tokenize in parallel
+        pre_token_freq = self._pre_tokenize_parallel(boundaries)
+
+        # BPE merging process
+
         pass
 
 
@@ -87,5 +171,5 @@ def bpe_train(
         - Merges do not cross pre-token boundaries or special token boundaries
         - Ties in merge frequency are broken lexicographically (higher pair wins)
     """
-    trainer = BPETokenizerTrainer(vocab_size, special_tokens)
+    trainer = BPETokenizerTrainer(vocab_size, special_tokens, num_workers=12)
     return trainer.train(input_path)
