@@ -1,0 +1,16 @@
+{
+  "dataset": "TinyStories",
+  "input_path": "/ocean/projects/cis250265p/xli45/assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
+  "vocab_size": 10000,
+  "special_tokens": [
+    "<|endoftext|>"
+  ],
+  "training_time_seconds": 241.1726086139679,
+  "training_time_minutes": 4.019543476899465,
+  "peak_memory_gb": 0.08922958374023438,
+  "memory_used_gb": 0.07073211669921875,
+  "final_vocab_size": 10000,
+  "num_merges": 9743,
+  "longest_token_id": 7160,
+  "longest_token_length": 15
+}
